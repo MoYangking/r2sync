@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>R2 Sync</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>R2 Sync</h1>
+        <p>Cloudflare R2 文件同步管理</p>
+      </div>
+      <span id="ready" class="pill">检测中</span>
+    </header>
+
+    <section id="loginPanel" class="panel narrow">
+      <h2>登录</h2>
+      <form id="loginForm">
+        <label>管理密码<input id="password" type="password" autocomplete="current-password" required></label>
+        <button type="submit">登录</button>
+      </form>
+      <pre id="loginLog"></pre>
+    </section>
+
+    <div id="app" hidden>
+      <section class="panel">
+        <div class="panel-head">
+          <h2>状态</h2>
+          <div class="actions">
+            <button id="syncNow">立即同步</button>
+            <button id="verifyNow">严格校验</button>
+            <button id="refresh">刷新</button>
+          </div>
+        </div>
+        <div class="grid stats">
+          <div><span>阶段</span><strong id="stage">-</strong></div>
+          <div><span>进度</span><strong id="progress">-</strong></div>
+          <div><span>已存储估算</span><strong id="bytes">-</strong></div>
+          <div><span>Class A</span><strong id="classA">-</strong></div>
+          <div><span>Class B</span><strong id="classB">-</strong></div>
+          <div><span>下次同步</span><strong id="nextSync">-</strong></div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>R2 配置</h2>
+        <form id="configForm" class="form-grid">
+          <label>Bucket<input name="bucket_name"></label>
+          <label>Account ID<input name="account_id"></label>
+          <label>Cloudflare Token<input name="cloudflare_token" type="password" placeholder="留空表示不修改"></label>
+          <label>对象前缀<input name="object_prefix"></label>
+          <label>监听地址<input name="listen_addr"></label>
+          <label>同步间隔<input name="sync_interval"></label>
+          <label>存储上限 bytes<input name="storage_cap_bytes" type="number"></label>
+          <label class="check"><input name="disable_cost_guards" type="checkbox">关闭成本保护</label>
+          <label class="check"><input name="strict_verify" type="checkbox">默认严格校验</label>
+          <label>风险确认<input name="confirm_risk" placeholder="需要时输入 CONFIRM"></label>
+          <button type="submit">保存配置</button>
+        </form>
+      </section>
+
+      <section class="panel">
+        <h2>目标路径</h2>
+        <div class="split">
+          <label>Targets<textarea id="targets" rows="8"></textarea></label>
+          <label>Excludes<textarea id="excludes" rows="8"></textarea></label>
+        </div>
+        <button id="saveTargets">保存目标</button>
+      </section>
+
+      <section class="panel">
+        <h2>对象</h2>
+        <div class="delete-row">
+          <input id="deleteTarget" placeholder="输入目标路径">
+          <input id="deleteConfirm" placeholder="输入 DELETE 确认">
+          <button id="deleteRemote" class="danger">删除远端对象</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>事件</h2>
+        <pre id="events"></pre>
+      </section>
+    </div>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>

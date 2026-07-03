@@ -1,0 +1,97 @@
+:root {
+  color-scheme: light dark;
+  --bg: #0f1115;
+  --panel: #171b22;
+  --line: #2b3340;
+  --text: #edf2f7;
+  --muted: #9aa7b4;
+  --accent: #31c48d;
+  --danger: #f05252;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: Arial, "Microsoft YaHei", sans-serif;
+}
+main {
+  width: min(1180px, calc(100% - 32px));
+  margin: 0 auto;
+  padding: 24px 0 40px;
+}
+header, .panel-head, .actions, .delete-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+h1, h2, p { margin: 0; }
+header { margin-bottom: 16px; }
+header p, .stats span { color: var(--muted); }
+.panel {
+  border: 1px solid var(--line);
+  background: var(--panel);
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 14px;
+}
+.narrow { max-width: 420px; }
+.grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+.stats div {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 10px;
+  min-width: 0;
+}
+.stats span, .stats strong {
+  display: block;
+  overflow-wrap: anywhere;
+}
+.form-grid, .split {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+label { display: grid; gap: 6px; color: var(--muted); }
+label.check { display: flex; align-items: center; color: var(--text); }
+input, textarea, button {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 9px 10px;
+  background: #0d1015;
+  color: var(--text);
+  font: inherit;
+}
+button {
+  cursor: pointer;
+  background: #243041;
+}
+button:hover { border-color: var(--accent); }
+button.danger { background: #3a1b20; border-color: #653035; }
+.pill {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 5px 10px;
+  color: var(--muted);
+}
+.pill.ok { color: #9ff5ca; border-color: rgba(49,196,141,.55); }
+.pill.warn { color: #fbd38d; }
+pre {
+  overflow: auto;
+  min-height: 90px;
+  max-height: 260px;
+  white-space: pre-wrap;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 10px;
+  background: #0d1015;
+}
+@media (max-width: 760px) {
+  header, .panel-head, .actions, .delete-row { align-items: stretch; flex-direction: column; }
+  .grid, .form-grid, .split { grid-template-columns: 1fr; }
+}

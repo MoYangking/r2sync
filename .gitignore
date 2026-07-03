@@ -1,0 +1,6 @@
+.r2sync/
+r2sync
+r2sync.exe
+dist/
+*.log
+*.tmp
