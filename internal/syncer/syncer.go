@@ -107,9 +107,10 @@ func (s *Syncer) Sync(ctx context.Context, mode Mode) (Result, error) {
 	switch mode {
 	case ModeInitial:
 		status.LastInitialSyncAt = start
+		status.NextScheduledAt = s.nextScheduledAt(start)
 	case ModeScheduled:
 		status.LastScheduledAt = start
-		status.NextScheduledAt = start.Add(s.Config.SyncInterval)
+		status.NextScheduledAt = s.nextScheduledAt(start)
 	case ModeManual:
 		status.LastManualSyncAt = start
 	}
@@ -369,4 +370,12 @@ func (s *Syncer) setStatus(status state.Status) error {
 		d.Status = status
 		return nil
 	})
+}
+
+func (s *Syncer) nextScheduledAt(start time.Time) time.Time {
+	interval := s.Config.SyncInterval
+	if interval <= 0 {
+		interval = config.DefaultSyncInterval
+	}
+	return start.Add(interval)
 }

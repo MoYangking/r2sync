@@ -26,6 +26,15 @@ function setText(id, value) {
   if (el) el.textContent = value || "-";
 }
 
+function timeText(value) {
+  if (!value) return "-";
+  if (String(value).startsWith("0001-01-01")) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  if (date.getUTCFullYear() <= 1) return "-";
+  return date.toLocaleString();
+}
+
 async function loadStatus() {
   const data = await api("/api/status");
   $("#loginPanel").hidden = true;
@@ -38,7 +47,7 @@ async function loadStatus() {
   setText("#bytes", humanBytes(data.current_bytes || 0));
   setText("#classA", String(data.counters?.class_a ?? 0));
   setText("#classB", String(data.counters?.class_b ?? 0));
-  setText("#nextSync", data.status?.next_scheduled_at || "-");
+  setText("#nextSync", timeText(data.status?.next_scheduled_at));
 
   const cfg = data.config || {};
   for (const name of ["bucket_name", "account_id", "object_prefix", "listen_addr", "sync_interval", "storage_cap_bytes"]) {

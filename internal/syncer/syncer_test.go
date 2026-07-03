@@ -116,6 +116,13 @@ func TestInitialSyncLocalWinsWhenRemoteMissing(t *testing.T) {
 	if string(remote.objects["data/sophnet.db"]) != "local" {
 		t.Fatalf("remote object = %q", remote.objects["data/sophnet.db"])
 	}
+	status := s.Store.Snapshot().Status
+	if status.NextScheduledAt.IsZero() {
+		t.Fatal("NextScheduledAt was not set after initial sync")
+	}
+	if status.LastInitialSyncAt.IsZero() {
+		t.Fatal("LastInitialSyncAt was not set after initial sync")
+	}
 }
 
 func TestScheduledSyncSkipsUnchangedLocalMetadata(t *testing.T) {

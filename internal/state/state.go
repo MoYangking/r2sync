@@ -41,6 +41,49 @@ type Status struct {
 	LastSuccessfulSync time.Time `json:"last_successful_sync_at,omitempty"`
 }
 
+func (s Status) MarshalJSON() ([]byte, error) {
+	type statusJSON struct {
+		Stage              string     `json:"stage"`
+		Progress           int        `json:"progress"`
+		CurrentTarget      string     `json:"current_target,omitempty"`
+		Ready              bool       `json:"ready"`
+		LastError          string     `json:"last_error,omitempty"`
+		LastInitialSyncAt  *time.Time `json:"last_initial_sync_at,omitempty"`
+		LastScheduledAt    *time.Time `json:"last_scheduled_at,omitempty"`
+		NextScheduledAt    *time.Time `json:"next_scheduled_at,omitempty"`
+		LastManualSyncAt   *time.Time `json:"last_manual_sync_at,omitempty"`
+		LastSuccessfulSync *time.Time `json:"last_successful_sync_at,omitempty"`
+	}
+	out := statusJSON{
+		Stage:         s.Stage,
+		Progress:      s.Progress,
+		CurrentTarget: s.CurrentTarget,
+		Ready:         s.Ready,
+		LastError:     s.LastError,
+	}
+	if !s.LastInitialSyncAt.IsZero() {
+		t := s.LastInitialSyncAt
+		out.LastInitialSyncAt = &t
+	}
+	if !s.LastScheduledAt.IsZero() {
+		t := s.LastScheduledAt
+		out.LastScheduledAt = &t
+	}
+	if !s.NextScheduledAt.IsZero() {
+		t := s.NextScheduledAt
+		out.NextScheduledAt = &t
+	}
+	if !s.LastManualSyncAt.IsZero() {
+		t := s.LastManualSyncAt
+		out.LastManualSyncAt = &t
+	}
+	if !s.LastSuccessfulSync.IsZero() {
+		t := s.LastSuccessfulSync
+		out.LastSuccessfulSync = &t
+	}
+	return json.Marshal(out)
+}
+
 type TargetRecord struct {
 	Target     string         `json:"target"`
 	AbsPath    string         `json:"abs_path"`
