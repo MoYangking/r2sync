@@ -105,7 +105,9 @@ jobs:
 
             echo "Building ${name}"
             CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
-              go build -trimpath -ldflags="-s -w" -o "${outdir}/${bin}" ./cmd/r2sync
+              go build -trimpath \
+              -ldflags="-s -w -X r2sync/internal/buildinfo.Version=${RELEASE_TAG}" \
+              -o "${outdir}/${bin}" ./cmd/r2sync
 
             if [ "$goos" = "windows" ]; then
               (cd "$outdir" && zip -9 "../release/${name}.zip" "$bin")

@@ -3,89 +3,396 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>R2 Sync</title>
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="r2sync — 轻量、可靠的 Cloudflare R2 状态文件同步层">
+  <title>r2sync · Cloudflare R2 状态文件同步</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Crect x='3' y='3' width='42' height='42' rx='12' fill='%230b1120'/%3E%3Cpath d='M33 17.5A11 11 0 0 0 14.5 21' fill='none' stroke='%2322d3ee' stroke-width='3.4' stroke-linecap='round'/%3E%3Cpath d='M15 30.5A11 11 0 0 0 33.5 27' fill='none' stroke='%23a78bfa' stroke-width='3.4' stroke-linecap='round'/%3E%3Cpath d='M33 10.5v7h-7' fill='none' stroke='%2322d3ee' stroke-width='3.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M15 37.5v-7h7' fill='none' stroke='%23a78bfa' stroke-width='3.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <main>
-    <header>
-      <div>
-        <h1>R2 Sync</h1>
-        <p>Cloudflare R2 文件同步管理</p>
+
+  <div class="bg" aria-hidden="true">
+    <div class="orb orb-a"></div>
+    <div class="orb orb-b"></div>
+    <div class="orb orb-c"></div>
+    <div class="bg-grid"></div>
+  </div>
+
+  <svg width="0" height="0" aria-hidden="true" focusable="false">
+    <defs>
+      <linearGradient id="grad-brand" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0" stop-color="#22d3ee"/>
+        <stop offset="1" stop-color="#a78bfa"/>
+      </linearGradient>
+    </defs>
+    <symbol id="i-mark" viewBox="0 0 48 48">
+      <rect x="3.5" y="3.5" width="41" height="41" rx="12.5" fill="rgba(255,255,255,.05)" stroke="url(#grad-brand)" stroke-width="1.4"/>
+      <path d="M33 17.5A11 11 0 0 0 14.5 21M33 10.5v7h-7" fill="none" stroke="#22d3ee" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M15 30.5A11 11 0 0 0 33.5 27M15 37.5v-7h7" fill="none" stroke="#a78bfa" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+    </symbol>
+    <symbol id="i-shield" viewBox="0 0 24 24">
+      <path d="M12 22s8-3.6 8-10V5.4L12 2 4 5.4V12c0 6.4 8 10 8 10z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/>
+      <path d="m8.8 11.8 2.3 2.3 4.2-4.6" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+    </symbol>
+    <symbol id="i-gauge" viewBox="0 0 24 24">
+      <path d="M12 15.5 15.8 9" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+      <path d="M5 19a9 9 0 1 1 14 0" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+    </symbol>
+    <symbol id="i-layers" viewBox="0 0 24 24">
+      <path d="m12 3 9 4.8-9 4.8-9-4.8L12 3z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/>
+      <path d="m3.6 12.5 8.4 4.5 8.4-4.5M3.6 16.7 12 21.2l8.4-4.5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/>
+    </symbol>
+  </svg>
+
+  <!-- ====== 登录 / 品牌视图 ====== -->
+  <section id="view-login" class="view-login" hidden>
+    <div class="login-wrap">
+      <div class="brand-block">
+        <svg class="brand-mark" width="64" height="64" aria-hidden="true"><use href="#i-mark"/></svg>
+        <h1 class="brand-name">r2sync</h1>
+        <p class="brand-tagline">轻量、可靠的 Cloudflare R2 状态文件同步层</p>
+        <p class="brand-sub">在业务启动前恢复关键文件，在运行中安静地保持云端为最新</p>
       </div>
-      <span id="ready" class="pill">检测中</span>
-    </header>
 
-    <section id="loginPanel" class="panel narrow">
-      <h2>登录</h2>
-      <form id="loginForm">
-        <label>管理密码<input id="password" type="password" autocomplete="current-password" required></label>
-        <button type="submit">登录</button>
+      <form id="login-form" class="glass card login-card">
+        <h2 class="card-title">管理控制台</h2>
+        <p class="card-desc">输入管理密码以继续。首次启动的密码只在启动日志打印一次。</p>
+        <label class="field">
+          <span>管理密码</span>
+          <input id="login-password" type="password" autocomplete="current-password" required placeholder="••••••••">
+        </label>
+        <button type="submit" id="login-submit" class="btn btn-primary btn-block">进入控制台</button>
+        <p id="login-error" class="form-error" hidden></p>
       </form>
-      <pre id="loginLog"></pre>
-    </section>
 
-    <div id="app" hidden>
-      <section class="panel">
-        <div class="panel-head">
-          <h2>状态</h2>
-          <div class="actions">
-            <button id="syncNow">立即同步</button>
-            <button id="verifyNow">严格校验</button>
-            <button id="refresh">刷新</button>
+      <div class="feature-row">
+        <div class="glass feature-chip">
+          <svg width="22" height="22" aria-hidden="true"><use href="#i-shield"/></svg>
+          <div>
+            <strong>启动门禁</strong>
+            <span>先恢复数据，再启动业务进程</span>
           </div>
         </div>
-        <div class="grid stats">
-          <div><span>阶段</span><strong id="stage">-</strong></div>
-          <div><span>进度</span><strong id="progress">-</strong></div>
-          <div><span>已存储估算</span><strong id="bytes">-</strong></div>
-          <div><span>Class A</span><strong id="classA">-</strong></div>
-          <div><span>Class B</span><strong id="classB">-</strong></div>
-          <div><span>下次同步</span><strong id="nextSync">-</strong></div>
+        <div class="glass feature-chip">
+          <svg width="22" height="22" aria-hidden="true"><use href="#i-gauge"/></svg>
+          <div>
+            <strong>成本保护</strong>
+            <span>存储上限与请求额度双重防线</span>
+          </div>
+        </div>
+        <div class="glass feature-chip">
+          <svg width="22" height="22" aria-hidden="true"><use href="#i-layers"/></svg>
+          <div>
+            <strong>单对象覆盖</strong>
+            <span>确定性对象键，不产生历史堆积</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ====== 控制台视图 ====== -->
+  <div id="view-app" hidden>
+    <header class="topbar glass">
+      <div class="topbar-brand">
+        <svg width="30" height="30" aria-hidden="true"><use href="#i-mark"/></svg>
+        <span class="topbar-name">r2sync</span>
+        <span id="version-chip" class="chip" hidden></span>
+      </div>
+      <div class="topbar-actions">
+        <span id="ready-pill" class="pill">检测中</span>
+        <button id="btn-sync" class="btn btn-primary btn-sm">立即同步</button>
+        <button id="btn-verify" class="btn btn-ghost btn-sm">严格校验</button>
+        <button id="btn-logout" class="btn btn-ghost btn-sm" title="退出登录">退出</button>
+      </div>
+    </header>
+
+    <main class="layout">
+
+      <div id="setup-hint" class="glass card hint-card" hidden>
+        <svg width="20" height="20" aria-hidden="true"><use href="#i-layers"/></svg>
+        <p id="setup-hint-text">尚未连接同步后端 —— 在下方「同步连接」中选择方式并填写凭据，保存后同步服务会立即启动，无需重启进程。</p>
+      </div>
+
+      <!-- 状态 -->
+      <section class="glass card hero-card">
+        <div class="hero-main">
+          <div class="hero-stage-block">
+            <p class="card-label">同步状态</p>
+            <div class="hero-stage">
+              <span id="stage-badge" class="badge badge-neutral">待机</span>
+              <span id="current-target" class="mono muted"></span>
+            </div>
+          </div>
+          <div class="hero-times">
+            <div class="hero-time">
+              <span>上次成功</span>
+              <strong id="last-success">—</strong>
+            </div>
+            <div class="hero-time">
+              <span>下次调度</span>
+              <strong id="next-sync">—</strong>
+            </div>
+          </div>
+        </div>
+        <div id="progress-track" class="progress-track" hidden>
+          <div id="progress-fill" class="progress-fill"></div>
+        </div>
+        <p id="status-error" class="form-error" hidden></p>
+      </section>
+
+      <!-- 用量 -->
+      <section class="metric-grid">
+        <div class="glass card metric-card">
+          <p class="card-label">远端存储</p>
+          <p class="metric-value"><strong id="m-storage">—</strong><span id="m-storage-cap" class="muted"></span></p>
+          <div class="meter">
+            <div id="meter-storage" class="meter-fill"></div>
+            <i class="tick" data-left="80"></i>
+          </div>
+          <p class="metric-note muted">上限为本地软保护，不是 R2 硬配额</p>
+        </div>
+        <div class="glass card metric-card" id="card-classa">
+          <p class="card-label">Class A 请求</p>
+          <p class="metric-value"><strong id="m-classa">—</strong><span id="m-classa-limit" class="muted"></span></p>
+          <div class="meter">
+            <div id="meter-classa" class="meter-fill"></div>
+            <i id="tick-a-warn" class="tick"></i>
+            <i id="tick-a-block" class="tick tick-strong"></i>
+          </div>
+          <p class="metric-note muted">写入/上传类操作 · 本月估算</p>
+        </div>
+        <div class="glass card metric-card" id="card-classb">
+          <p class="card-label">Class B 请求</p>
+          <p class="metric-value"><strong id="m-classb">—</strong><span id="m-classb-limit" class="muted"></span></p>
+          <div class="meter">
+            <div id="meter-classb" class="meter-fill"></div>
+            <i id="tick-b-warn" class="tick"></i>
+            <i id="tick-b-block" class="tick tick-strong"></i>
+          </div>
+          <p class="metric-note muted">读取/元数据类操作 · 本月估算</p>
+        </div>
+        <div class="glass card metric-card" id="card-repo" hidden>
+          <p class="card-label">GitHub 仓库</p>
+          <p class="metric-value"><strong id="m-repo" class="mono repo-name">—</strong></p>
+          <p class="metric-note"><span id="m-repo-branch" class="chip">main</span></p>
+          <p class="metric-note muted">目标集中于仓库文件夹，原路径以软链接接入</p>
+        </div>
+        <div class="glass card metric-card" id="card-transfer">
+          <p class="card-label">累计传输</p>
+          <div class="transfer-rows">
+            <div class="transfer-row"><span class="muted">上传</span><strong id="m-up">—</strong></div>
+            <div class="transfer-row"><span class="muted">下载</span><strong id="m-down">—</strong></div>
+          </div>
+          <p class="metric-note muted">自本月计数周期开始</p>
         </div>
       </section>
 
-      <section class="panel">
-        <h2>R2 配置</h2>
-        <form id="configForm" class="form-grid">
-          <label>Bucket<input name="bucket_name"></label>
-          <label>Account ID<input name="account_id"></label>
-          <label>Cloudflare Token<input name="cloudflare_token" type="password" placeholder="留空表示不修改"></label>
-          <label>对象前缀<input name="object_prefix"></label>
-          <label>监听地址<input name="listen_addr"></label>
-          <label>同步间隔<input name="sync_interval"></label>
-          <label>存储上限 bytes<input name="storage_cap_bytes" type="number"></label>
-          <label class="check"><input name="disable_cost_guards" type="checkbox">关闭成本保护</label>
-          <label class="check"><input name="strict_verify" type="checkbox">默认严格校验</label>
-          <label>风险确认<input name="confirm_risk" placeholder="需要时输入 CONFIRM"></label>
-          <button type="submit">保存配置</button>
+      <!-- 目标文件 -->
+      <section class="glass card">
+        <div class="card-head">
+          <h2 class="card-title">目标文件</h2>
+          <span id="targets-count" class="muted"></span>
+        </div>
+        <div class="table-wrap">
+          <table class="targets-table">
+            <thead>
+              <tr>
+                <th>目标</th>
+                <th>本地</th>
+                <th>远端</th>
+                <th>最近动作</th>
+                <th>更新时间</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="targets-body"></tbody>
+          </table>
+        </div>
+        <p id="targets-empty" class="empty" hidden>暂无同步记录 —— 保存目标路径并完成一次同步后，这里会展示每个文件的本地与远端状态。</p>
+      </section>
+
+      <!-- 配置 -->
+      <section class="config-grid">
+        <form id="form-conn" class="glass card">
+          <div class="card-head">
+            <h2 class="card-title">同步连接</h2>
+          </div>
+          <div class="field-grid">
+            <div class="field">
+              <span>同步方式</span>
+              <div class="seg" id="method-seg" role="radiogroup" aria-label="同步方式">
+                <button type="button" class="seg-btn active" data-method="r2">Cloudflare R2</button>
+                <button type="button" class="seg-btn" data-method="github">GitHub 仓库</button>
+              </div>
+            </div>
+
+            <div id="group-r2" class="field-grid method-group">
+              <label class="field">
+                <span>Bucket 名称</span>
+                <input id="f-bucket" autocomplete="off" placeholder="my-r2-bucket">
+              </label>
+              <label class="field">
+                <span>Account ID <em class="opt">可选，多账号时建议填写</em></span>
+                <input id="f-account" autocomplete="off" class="mono" placeholder="cloudflare account id">
+              </label>
+              <label class="field">
+                <span>Cloudflare API Token</span>
+                <input id="f-token" type="password" autocomplete="new-password" placeholder="留空表示不修改">
+              </label>
+              <label class="field">
+                <span>对象前缀 <em class="opt">用于同 bucket 隔离多个项目</em></span>
+                <input id="f-prefix" autocomplete="off" class="mono" placeholder="prod/project-a">
+              </label>
+            </div>
+
+            <div id="group-github" class="field-grid method-group" hidden>
+              <p class="method-desc">目标文件会集中迁移到仓库文件夹，原路径以软链接接入，程序无感知；变更以 git 提交推送到 GitHub。需要系统安装 git，单文件不能超过 100 MiB。</p>
+              <label class="field">
+                <span>仓库 <em class="opt">owner/name，建议私有仓库</em></span>
+                <input id="f-gh-repo" autocomplete="off" class="mono" placeholder="your-name/state-backup">
+              </label>
+              <label class="field">
+                <span>GitHub Token <em class="opt">需要 repo 读写权限</em></span>
+                <input id="f-gh-token" type="password" autocomplete="new-password" placeholder="留空表示不修改">
+              </label>
+              <label class="field">
+                <span>分支</span>
+                <input id="f-gh-branch" autocomplete="off" class="mono" placeholder="main">
+              </label>
+            </div>
+          </div>
+          <div class="card-actions">
+            <button type="submit" class="btn btn-primary">保存连接</button>
+            <span class="muted action-note">保存后立即生效并触发初始同步</span>
+          </div>
+        </form>
+
+        <form id="form-behavior" class="glass card">
+          <div class="card-head">
+            <h2 class="card-title">同步行为</h2>
+          </div>
+          <div class="field-grid">
+            <label class="field">
+              <span>同步间隔</span>
+              <input id="f-interval" autocomplete="off" class="mono" placeholder="5h">
+            </label>
+            <div class="preset-row" role="group" aria-label="常用间隔">
+              <button type="button" class="btn btn-ghost btn-xs preset" data-val="30m">30m</button>
+              <button type="button" class="btn btn-ghost btn-xs preset" data-val="1h">1h</button>
+              <button type="button" class="btn btn-ghost btn-xs preset" data-val="5h">5h</button>
+              <button type="button" class="btn btn-ghost btn-xs preset" data-val="24h">24h</button>
+            </div>
+            <label class="field">
+              <span>存储保护上限（GiB）</span>
+              <input id="f-cap-gib" type="number" min="0.1" step="0.1" inputmode="decimal">
+            </label>
+            <label class="field">
+              <span>监听地址 <em class="opt">重启进程后生效</em></span>
+              <input id="f-listen" autocomplete="off" class="mono" placeholder="0.0.0.0:5321">
+            </label>
+            <label class="switch">
+              <span class="switch-text">
+                <strong>默认严格校验</strong>
+                <span>每次同步都检查远端元数据，会增加 Class B 请求</span>
+              </span>
+              <input id="f-strict" type="checkbox">
+              <span class="knob" aria-hidden="true"></span>
+            </label>
+            <label class="switch">
+              <span class="switch-text">
+                <strong>关闭成本保护</strong>
+                <span>移除存储与请求额度防线，不建议开启</span>
+              </span>
+              <input id="f-guards-off" type="checkbox">
+              <span class="knob" aria-hidden="true"></span>
+            </label>
+          </div>
+          <div class="card-actions">
+            <button type="submit" class="btn btn-primary">保存行为</button>
+          </div>
         </form>
       </section>
 
-      <section class="panel">
-        <h2>目标路径</h2>
-        <div class="split">
-          <label>Targets<textarea id="targets" rows="8"></textarea></label>
-          <label>Excludes<textarea id="excludes" rows="8"></textarea></label>
-        </div>
-        <button id="saveTargets">保存目标</button>
+      <section class="config-grid">
+        <form id="form-targets" class="glass card">
+          <div class="card-head">
+            <h2 class="card-title">目标路径</h2>
+          </div>
+          <label class="field">
+            <span>Targets（每行一个，相对基准目录）</span>
+            <textarea id="input-targets" rows="6" class="mono" spellcheck="false" placeholder="data/app.db&#10;config/runtime.json"></textarea>
+          </label>
+          <label class="field">
+            <span>Excludes（保留字段，同步以显式 targets 为准）</span>
+            <textarea id="input-excludes" rows="3" class="mono" spellcheck="false"></textarea>
+          </label>
+          <div class="card-actions">
+            <button type="submit" class="btn btn-primary">保存目标</button>
+            <span class="muted action-note">新目标会先检查远端再决定恢复或上传</span>
+          </div>
+        </form>
+
+        <form id="form-password" class="glass card">
+          <div class="card-head">
+            <h2 class="card-title">安全</h2>
+          </div>
+          <div class="field-grid">
+            <label class="field">
+              <span>当前密码</span>
+              <input id="f-pw-current" type="password" autocomplete="current-password">
+            </label>
+            <label class="field">
+              <span>新密码（至少 8 位）</span>
+              <input id="f-pw-new" type="password" autocomplete="new-password">
+            </label>
+            <label class="field">
+              <span>确认新密码</span>
+              <input id="f-pw-confirm" type="password" autocomplete="new-password">
+            </label>
+          </div>
+          <div class="card-actions">
+            <button type="submit" class="btn btn-primary">修改密码</button>
+            <span class="muted action-note">修改后其它已登录会话将被吊销</span>
+          </div>
+        </form>
       </section>
 
-      <section class="panel">
-        <h2>对象</h2>
-        <div class="delete-row">
-          <input id="deleteTarget" placeholder="输入目标路径">
-          <input id="deleteConfirm" placeholder="输入 DELETE 确认">
-          <button id="deleteRemote" class="danger">删除远端对象</button>
+      <!-- 事件 -->
+      <section class="glass card">
+        <div class="card-head">
+          <h2 class="card-title">最近事件</h2>
         </div>
+        <ol id="events-list" class="events"></ol>
+        <p id="events-empty" class="empty" hidden>暂无事件</p>
       </section>
 
-      <section class="panel">
-        <h2>事件</h2>
-        <pre id="events"></pre>
-      </section>
+      <footer class="footer">
+        <span>r2sync <span id="version-footer"></span></span>
+        <span>数据仅在本机与你的 R2 bucket 之间流动</span>
+      </footer>
+    </main>
+  </div>
+
+  <!-- ====== 模态 ====== -->
+  <div id="modal-root" class="modal-root" hidden>
+    <div id="modal-backdrop" class="modal-backdrop"></div>
+    <div class="glass card modal-card" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <h3 id="modal-title" class="card-title"></h3>
+      <p id="modal-text" class="card-desc"></p>
+      <label class="field" id="modal-confirm-field" hidden>
+        <span id="modal-confirm-label"></span>
+        <input id="modal-confirm-input" autocomplete="off" spellcheck="false" class="mono">
+      </label>
+      <div class="modal-actions">
+        <button id="modal-cancel" class="btn btn-ghost">取消</button>
+        <button id="modal-ok" class="btn btn-danger">确认</button>
+      </div>
     </div>
-  </main>
+  </div>
+
+  <div id="toast-root" class="toast-root" aria-live="polite"></div>
+
   <script src="/app.js"></script>
 </body>
 </html>

@@ -3,9 +3,12 @@ package syncer
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -54,7 +57,7 @@ func (f *fakeRemote) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
-func testSyncer(t *testing.T, remote *fakeRemote) (*Syncer, string) {
+func testSyncer(t *testing.T, remote r2.ObjectStore) (*Syncer, string) {
 	t.Helper()
 	base := t.TempDir()
 	cfg := config.Defaults()
@@ -145,6 +148,195 @@ func TestScheduledSyncSkipsUnchangedLocalMetadata(t *testing.T) {
 	if res.Skipped != 1 {
 		t.Fatalf("Skipped = %d", res.Skipped)
 	}
+}
+
+type failUploadRemote struct {
+	*fakeRemote
+}
+
+func (f *failUploadRemote) Upload(ctx context.Context, key string, filePath string, metadata map[string]string) (r2.Object, error) {
+	return r2.Object{}, fmt.Errorf("simulated upload failure")
+}
+
+func TestScheduledSyncFailureKeepsReady(t *testing.T) {
+	remote := newFakeRemote()
+	s, path := testSyncer(t, remote)
+	if err := fsutil.EnsureParent(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("local"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.InitialSync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !s.Store.Snapshot().Status.Ready {
+		t.Fatal("expected ready after initial sync")
+	}
+	if err := os.WriteFile(path, []byte("changed content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	failing := New(s.Config, s.Store, &failUploadRemote{fakeRemote: remote})
+	if _, err := failing.ScheduledSync(context.Background()); err == nil {
+		t.Fatal("expected scheduled sync to fail")
+	}
+	status := s.Store.Snapshot().Status
+	if !status.Ready {
+		t.Fatal("scheduled sync failure must not flip the startup gate to not-ready")
+	}
+	if status.Stage != "error" {
+		t.Fatalf("Stage = %q, want error", status.Stage)
+	}
+}
+
+func TestScheduledSyncRestoresNewTargetFromRemote(t *testing.T) {
+	remote := newFakeRemote()
+	s, path := testSyncer(t, remote)
+	if err := fsutil.EnsureParent(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("local"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.InitialSync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// data/extra.db already exists remotely but was never synced by this
+	// instance; adding it as a target must restore it instead of marking it
+	// missing forever (or blindly uploading over it).
+	hash := hashBytes(t, []byte("remote extra"))
+	remote.objects["data/extra.db"] = []byte("remote extra")
+	remote.meta["data/extra.db"] = map[string]string{"r2sync-sha256": hash}
+
+	cfg := s.Config
+	cfg.Targets = append([]string(nil), cfg.Targets...)
+	cfg.Targets = append(cfg.Targets, "data/extra.db")
+	res, err := New(cfg, s.Store, remote).ScheduledSync(context.Background())
+	if err != nil {
+		t.Fatalf("ScheduledSync() error = %v", err)
+	}
+	if res.Restored != 1 {
+		t.Fatalf("Restored = %d, want 1", res.Restored)
+	}
+	got, err := os.ReadFile(filepath.Join(cfg.BaseDir, "data", "extra.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "remote extra" {
+		t.Fatalf("restored file = %q", got)
+	}
+}
+
+type blockingRemote struct {
+	*fakeRemote
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingRemote) Head(ctx context.Context, key string) (r2.Object, bool, error) {
+	b.once.Do(func() { close(b.entered) })
+	<-b.release
+	return b.fakeRemote.Head(ctx, key)
+}
+
+func TestConcurrentSyncReturnsBusy(t *testing.T) {
+	remote := &blockingRemote{
+		fakeRemote: newFakeRemote(),
+		entered:    make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+	s, path := testSyncer(t, remote)
+	if err := fsutil.EnsureParent(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("local"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.ManualSync(context.Background())
+		done <- err
+	}()
+	<-remote.entered
+
+	if _, err := New(s.Config, s.Store, remote).ManualSync(context.Background()); !errors.Is(err, ErrSyncBusy) {
+		t.Fatalf("second sync error = %v, want ErrSyncBusy", err)
+	}
+	close(remote.release)
+	if err := <-done; err != nil {
+		t.Fatalf("first sync error = %v", err)
+	}
+}
+
+func TestManagerReconfigureRunsInitialAndScheduledSync(t *testing.T) {
+	remote := newFakeRemote()
+	base := t.TempDir()
+	cfg := config.Defaults()
+	cfg.BaseDir = base
+	cfg.StateDir = filepath.Join(base, ".r2sync")
+	cfg.Targets = []string{"data/app.db"}
+	cfg.SyncIntervalText = "60ms"
+	cfg.StorageCapBytes = 1024 * 1024
+	if err := cfg.Normalize(); err != nil {
+		t.Fatal(err)
+	}
+	st, err := state.Open(filepath.Join(cfg.StateDir, config.DefaultStateFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(base, "data", "app.db")
+	if err := fsutil.EnsureParent(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("v1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m := NewManager(st, nil, func(_ context.Context, c config.Config) (Runner, error) {
+		return New(c, st, remote), nil
+	})
+
+	incomplete := cfg
+	incomplete.BucketName = ""
+	incomplete.CloudflareToken = ""
+	m.Start(ctx, incomplete)
+
+	complete := cfg
+	complete.BucketName = "bucket"
+	complete.CloudflareToken = "token"
+	m.Reconfigure(complete)
+
+	waitFor(t, 3*time.Second, "initial sync via manager", func() bool {
+		return st.Snapshot().Status.Ready
+	})
+	if string(remote.objects["data/app.db"]) != "v1" {
+		t.Fatalf("remote object = %q", remote.objects["data/app.db"])
+	}
+
+	// A scheduled run must pick up local changes without any reconfigure.
+	if err := os.WriteFile(path, []byte("v2 with longer content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 3*time.Second, "scheduled sync upload", func() bool {
+		return string(remote.objects["data/app.db"]) == "v2 with longer content"
+	})
+}
+
+func waitFor(t *testing.T, timeout time.Duration, what string, fn func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if fn() {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
 }
 
 func hashBytes(t *testing.T, data []byte) string {

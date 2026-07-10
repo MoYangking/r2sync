@@ -2,6 +2,7 @@ package syncer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -21,6 +22,26 @@ const (
 	ModeManual    Mode = "manual"
 	ModeVerify    Mode = "verify"
 )
+
+// ErrSyncBusy is returned when a sync is requested while another sync is
+// already running in this process.
+var ErrSyncBusy = errors.New("another sync is already running")
+
+// syncGate serializes syncs across all Runner instances in the process, so a
+// manual sync cannot interleave with a scheduled one and double-spend
+// requests on the same targets.
+var syncGate = make(chan struct{}, 1)
+
+// acquireSyncGate reserves the process-wide sync slot. It returns a release
+// function, or ErrSyncBusy when another sync currently holds the slot.
+func acquireSyncGate() (func(), error) {
+	select {
+	case syncGate <- struct{}{}:
+		return func() { <-syncGate }, nil
+	default:
+		return nil, ErrSyncBusy
+	}
+}
 
 type Syncer struct {
 	Config config.Config
@@ -66,8 +87,17 @@ func (s *Syncer) Sync(ctx context.Context, mode Mode) (Result, error) {
 	if len(s.Config.Targets) == 0 {
 		return Result{}, fmt.Errorf("no sync targets configured")
 	}
+	release, err := acquireSyncGate()
+	if err != nil {
+		return Result{}, err
+	}
+	defer release()
 	start := time.Now().UTC()
-	_ = s.setStatus(state.Status{Stage: string(mode), Progress: 0, Ready: false})
+	// Ready means "initial sync completed"; periodic runs must not flip the
+	// startup gate back to not-ready while (or after) they run.
+	wasReady := s.Store.Snapshot().Status.Ready
+	runningReady := wasReady && mode != ModeInitial
+	_ = s.setStatus(state.Status{Stage: string(mode), Progress: 0, Ready: runningReady})
 	var result Result
 	var firstErr error
 	for i, target := range s.Config.Targets {
@@ -77,7 +107,7 @@ func (s *Syncer) Sync(ctx context.Context, mode Mode) (Result, error) {
 		default:
 		}
 		progress := int(float64(i) / float64(len(s.Config.Targets)) * 100)
-		_ = s.setStatus(state.Status{Stage: string(mode), Progress: progress, CurrentTarget: target})
+		_ = s.setStatus(state.Status{Stage: string(mode), Progress: progress, CurrentTarget: target, Ready: runningReady})
 		action, err := s.syncTarget(ctx, mode, target)
 		if err != nil {
 			result.Errors++
@@ -98,26 +128,31 @@ func (s *Syncer) Sync(ctx context.Context, mode Mode) (Result, error) {
 			result.Skipped++
 		}
 	}
+	ready := firstErr == nil
+	if mode != ModeInitial {
+		ready = wasReady
+	}
 	status := state.Status{
 		Stage:              "complete",
 		Progress:           100,
-		Ready:              firstErr == nil,
+		Ready:              ready,
 		LastSuccessfulSync: time.Now().UTC(),
 	}
 	switch mode {
 	case ModeInitial:
 		status.LastInitialSyncAt = start
-		status.NextScheduledAt = s.nextScheduledAt(start)
+		status.NextScheduledAt = s.nextScheduledAt(time.Now().UTC())
 	case ModeScheduled:
 		status.LastScheduledAt = start
-		status.NextScheduledAt = s.nextScheduledAt(start)
+		status.NextScheduledAt = s.nextScheduledAt(time.Now().UTC())
 	case ModeManual:
 		status.LastManualSyncAt = start
 	}
 	if firstErr != nil {
 		status.Stage = "error"
-		status.Ready = false
+		status.Ready = ready
 		status.LastError = firstErr.Error()
+		status.LastSuccessfulSync = time.Time{}
 		_ = s.setStatus(status)
 		return result, firstErr
 	}
@@ -160,8 +195,13 @@ func (s *Syncer) syncTarget(ctx context.Context, mode Mode, target string) (stri
 
 	var remote r2.Object
 	var remoteExists bool
-	needHead := mode == ModeInitial || mode == ModeVerify || s.Config.StrictVerify
 	record := s.Store.Snapshot().Targets[plan.RelPath]
+	// A target with no record has never been synced by this instance (for
+	// example it was just added through the UI). It must go through initial
+	// semantics: check the remote first instead of blindly uploading over an
+	// existing object or leaving a restorable object unrestored.
+	firstSeen := record.UpdatedAt.IsZero()
+	needHead := mode == ModeInitial || mode == ModeVerify || s.Config.StrictVerify || firstSeen
 	if needHead || record.Remote.Exists {
 		guard := cost.Guard{Config: s.Config, State: s.Store.Snapshot()}
 		if decision := guard.CheckClassB(1); !decision.Allowed {
@@ -186,7 +226,7 @@ func (s *Syncer) syncTarget(ctx context.Context, mode Mode, target string) (stri
 		}
 	}
 
-	if mode == ModeInitial {
+	if mode == ModeInitial || firstSeen {
 		return s.initialTarget(ctx, plan, local, remote, remoteExists)
 	}
 	return s.periodicTarget(ctx, plan, local, remote, remoteExists, record)
@@ -349,8 +389,23 @@ func (s *Syncer) record(plan fsutil.TargetPlan, local fsutil.Metadata, remote r2
 	})
 }
 
+// Check is part of Runner. R2 credentials are fully validated when the
+// remote store is constructed, so there is nothing left to verify here.
+func (s *Syncer) Check(ctx context.Context) error {
+	if s.Remote == nil {
+		return config.ErrMissingCloudflareConfig
+	}
+	return nil
+}
+
 func (s *Syncer) setStatus(status state.Status) error {
-	return s.Store.Update(func(d *state.Data) error {
+	return applyStatus(s.Store, status)
+}
+
+// applyStatus writes a status update while preserving previously recorded
+// timestamps that the update leaves unset.
+func applyStatus(store *state.Store, status state.Status) error {
+	return store.Update(func(d *state.Data) error {
 		prev := d.Status
 		if status.LastInitialSyncAt.IsZero() {
 			status.LastInitialSyncAt = prev.LastInitialSyncAt

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"syscall"
 
+	"r2sync/internal/buildinfo"
 	"r2sync/internal/config"
 	"r2sync/internal/r2"
 	"r2sync/internal/server"
@@ -61,6 +62,8 @@ func run(args []string) int {
 		}
 		printHelp()
 		return 1
+	case "version", "--version", "-v":
+		fmt.Println("r2sync", buildinfo.Version)
 	default:
 		printHelp()
 		return 1
@@ -69,17 +72,20 @@ func run(args []string) int {
 }
 
 func printHelp() {
-	fmt.Println(`r2sync - Cloudflare R2 file sync
+	fmt.Println(`r2sync - state file sync to Cloudflare R2 or GitHub (` + buildinfo.Version + `)
 
 Usage:
   r2sync serve
   r2sync sync
   r2sync run -- <command> [args...]
   r2sync config check
+  r2sync version
 
 Environment:
-  R2SYNC_BUCKET, R2SYNC_TOKEN, R2SYNC_ACCOUNT_ID, R2SYNC_TARGETS,
-  R2SYNC_STATE_DIR, R2SYNC_BASE_DIR, R2SYNC_ADMIN_PASSWORD`)
+  R2SYNC_SYNC_METHOD (r2|github), R2SYNC_TARGETS, R2SYNC_ADMIN_PASSWORD,
+  R2SYNC_BUCKET, R2SYNC_TOKEN, R2SYNC_ACCOUNT_ID,
+  R2SYNC_GITHUB_REPO, R2SYNC_GITHUB_PAT, R2SYNC_GITHUB_BRANCH,
+  R2SYNC_STATE_DIR, R2SYNC_BASE_DIR`)
 }
 
 func loadRuntime(log *slog.Logger) (config.Config, *state.Store, error) {
@@ -98,20 +104,19 @@ func loadRuntime(log *slog.Logger) (config.Config, *state.Store, error) {
 	return cfg, st, nil
 }
 
-func remoteFactory(ctx context.Context, cfg config.Config) (r2.ObjectStore, error) {
-	setup, err := r2.Setup(ctx, cfg)
-	if err != nil {
-		return nil, err
+// makeRunnerFactory builds the sync runner for the configured method: the
+// Cloudflare R2 object syncer or the GitHub repository (symlink) syncer.
+func makeRunnerFactory(st *state.Store) syncer.RunnerFactory {
+	return func(ctx context.Context, cfg config.Config) (syncer.Runner, error) {
+		if cfg.SyncMethod == config.MethodGitHub {
+			return syncer.NewGitSyncer(cfg, st), nil
+		}
+		setup, err := r2.Setup(ctx, cfg)
+		if err != nil {
+			return nil, err
+		}
+		return syncer.New(cfg, st, setup.Store), nil
 	}
-	return setup.Store, nil
-}
-
-func setupRemote(ctx context.Context, cfg config.Config) (r2.ObjectStore, error) {
-	setup, err := r2.Setup(ctx, cfg)
-	if err != nil {
-		return nil, err
-	}
-	return setup.Store, nil
 }
 
 func serve(ctx context.Context, log *slog.Logger) error {
@@ -119,22 +124,11 @@ func serve(ctx context.Context, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	srv := server.New(cfg, st, log, remoteFactory)
-	if cfg.HasCloudflareConfig() {
-		remote, err := setupRemote(ctx, cfg)
-		if err != nil {
-			log.Error("R2 setup failed; management UI remains available", "error", err)
-		} else {
-			s := syncer.New(cfg, st, remote)
-			if _, err := s.InitialSync(ctx); err != nil {
-				log.Error("initial sync failed; management UI remains available", "error", err)
-			} else {
-				go (&syncer.Scheduler{Syncer: s, Log: log}).Run(ctx)
-			}
-		}
-	} else {
-		log.Warn("R2 config is incomplete; open management UI to configure bucket and token")
-	}
+	factory := makeRunnerFactory(st)
+	manager := syncer.NewManager(st, log, factory)
+	srv := server.New(cfg, st, log, factory)
+	srv.OnConfigChange = manager.Reconfigure
+	manager.Start(ctx, cfg)
 	return srv.ListenAndServe(ctx)
 }
 
@@ -143,24 +137,31 @@ func syncOnce(ctx context.Context, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	remote, err := setupRemote(ctx, cfg)
+	runner, err := makeRunnerFactory(st)(ctx, cfg)
 	if err != nil {
 		return err
 	}
-	_, err = syncer.New(cfg, st, remote).ManualSync(ctx)
+	_, err = runner.Sync(ctx, syncer.ModeManual)
 	return err
 }
 
 func configCheck(ctx context.Context, log *slog.Logger) error {
-	cfg, _, err := loadRuntime(log)
+	cfg, st, err := loadRuntime(log)
 	if err != nil {
 		return err
 	}
-	setup, err := r2.Setup(ctx, cfg)
+	runner, err := makeRunnerFactory(st)(ctx, cfg)
 	if err != nil {
 		return err
 	}
-	log.Info("configuration is valid", "bucket", cfg.BucketName, "account_id", setup.AccountID)
+	if err := runner.Check(ctx); err != nil {
+		return err
+	}
+	if cfg.SyncMethod == config.MethodGitHub {
+		log.Info("configuration is valid", "method", cfg.SyncMethod, "repo", cfg.GitHubRepo, "branch", cfg.GitHubBranch)
+	} else {
+		log.Info("configuration is valid", "method", cfg.SyncMethod, "bucket", cfg.BucketName, "account_id", cfg.AccountID)
+	}
 	return nil
 }
 
@@ -175,19 +176,22 @@ func runCommand(ctx context.Context, log *slog.Logger, args []string) (int, erro
 	if err != nil {
 		return 1, err
 	}
-	remote, err := setupRemote(ctx, cfg)
+	factory := makeRunnerFactory(st)
+	runner, err := factory(ctx, cfg)
 	if err != nil {
 		return 1, err
 	}
-	s := syncer.New(cfg, st, remote)
-	if _, err := s.InitialSync(ctx); err != nil {
+	if _, err := runner.Sync(ctx, syncer.ModeInitial); err != nil {
 		return 1, err
 	}
 	childCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	go (&syncer.Scheduler{Syncer: s, Log: log}).Run(childCtx)
+	manager := syncer.NewManager(st, log, factory)
+	manager.MarkInitialSynced(cfg)
+	manager.Start(childCtx, cfg)
 	go func() {
-		srv := server.New(cfg, st, log, remoteFactory)
+		srv := server.New(cfg, st, log, factory)
+		srv.OnConfigChange = manager.Reconfigure
 		if err := srv.ListenAndServe(childCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("management server failed", "error", err)
 		}

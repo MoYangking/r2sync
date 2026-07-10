@@ -6,32 +6,47 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"r2sync/internal/buildinfo"
 	"r2sync/internal/config"
 	"r2sync/internal/cost"
-	"r2sync/internal/r2"
 	"r2sync/internal/state"
 	"r2sync/internal/syncer"
 	"r2sync/internal/ui"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
-type RemoteFactory func(context.Context, config.Config) (r2.ObjectStore, error)
+type RunnerFactory = syncer.RunnerFactory
+
+const (
+	sessionCookieName = "r2sync_session"
+	sessionTTL        = 24 * time.Hour
+	minPasswordLength = 8
+)
 
 type Server struct {
 	cfgMu         sync.RWMutex
 	cfg           config.Config
 	store         *state.Store
 	log           *slog.Logger
-	remoteFactory RemoteFactory
+	runnerFactory RunnerFactory
+
+	// OnConfigChange is invoked after a configuration or targets update has
+	// been saved, so the sync manager can apply it without a restart.
+	OnConfigChange func(config.Config)
 
 	sessionMu sync.Mutex
 	sessions  map[string]time.Time
+
+	logins loginLimiter
 }
 
-func New(cfg config.Config, store *state.Store, log *slog.Logger, factory RemoteFactory) *Server {
+func New(cfg config.Config, store *state.Store, log *slog.Logger, factory RunnerFactory) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -39,7 +54,7 @@ func New(cfg config.Config, store *state.Store, log *slog.Logger, factory Remote
 		cfg:           cfg,
 		store:         store,
 		log:           log,
-		remoteFactory: factory,
+		runnerFactory: factory,
 		sessions:      map[string]time.Time{},
 	}
 }
@@ -50,6 +65,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/ready", s.handleReady)
 	mux.HandleFunc("POST /api/login", s.handleLogin)
 	mux.HandleFunc("POST /api/logout", s.withAuth(s.handleLogout))
+	mux.HandleFunc("POST /api/password", s.withAuth(s.handlePassword))
 	mux.HandleFunc("GET /api/progress", s.withAuth(s.handleProgress))
 	mux.HandleFunc("GET /api/status", s.withAuth(s.handleStatus))
 	mux.HandleFunc("GET /api/config", s.withAuth(s.handleGetConfig))
@@ -60,7 +76,21 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/verify", s.withAuth(s.handleVerify))
 	mux.HandleFunc("POST /api/objects/delete", s.withAuth(s.handleDelete))
 	mux.Handle("/", http.FileServerFS(ui.StaticFS()))
-	return mux
+	return securityHeaders(mux)
+}
+
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "no-referrer")
+		h.Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			h.Set("Cache-Control", "no-store")
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) ListenAndServe(ctx context.Context) error {
@@ -84,7 +114,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "version": buildinfo.Version})
 }
 
 func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
@@ -93,6 +123,12 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	ip := clientIP(r)
+	if wait := s.logins.blockedFor(ip); wait > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())+1))
+		writeError(w, http.StatusTooManyRequests, "too_many_attempts", "too many failed logins; try again later")
+		return
+	}
 	var body struct {
 		Password string `json:"password"`
 	}
@@ -102,35 +138,78 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	hash := s.store.Snapshot().AdminPasswordHash
 	if !checkPassword(hash, body.Password) {
+		s.logins.recordFailure(ip)
 		writeError(w, http.StatusUnauthorized, "unauthorized", "invalid password")
 		return
 	}
+	s.logins.recordSuccess(ip)
 	token, err := randomSecret(32)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "session_error", err.Error())
 		return
 	}
 	s.sessionMu.Lock()
-	s.sessions[token] = time.Now().Add(24 * time.Hour)
+	s.pruneSessionsLocked()
+	s.sessions[token] = time.Now().Add(sessionTTL)
 	s.sessionMu.Unlock()
-	http.SetCookie(w, &http.Cookie{
-		Name:     "r2sync_session",
-		Value:    token,
-		Path:     "/",
-		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
-		Expires:  time.Now().Add(24 * time.Hour),
-	})
+	http.SetCookie(w, s.sessionCookie(r, token, sessionTTL))
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
-	if cookie, err := r.Cookie("r2sync_session"); err == nil {
+	if cookie, err := r.Cookie(sessionCookieName); err == nil {
 		s.sessionMu.Lock()
 		delete(s.sessions, cookie.Value)
 		s.sessionMu.Unlock()
 	}
-	http.SetCookie(w, &http.Cookie{Name: "r2sync_session", Value: "", Path: "/", MaxAge: -1, HttpOnly: true})
+	expired := s.sessionCookie(r, "", 0)
+	expired.MaxAge = -1
+	http.SetCookie(w, expired)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handlePassword(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		CurrentPassword string `json:"current_password"`
+		NewPassword     string `json:"new_password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
+		return
+	}
+	if !checkPassword(s.store.Snapshot().AdminPasswordHash, body.CurrentPassword) {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "current password is incorrect")
+		return
+	}
+	if len(body.NewPassword) < minPasswordLength {
+		writeError(w, http.StatusBadRequest, "weak_password", "new password must be at least 8 characters")
+		return
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(body.NewPassword), bcrypt.DefaultCost)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "hash_failed", err.Error())
+		return
+	}
+	if err := s.store.Update(func(d *state.Data) error {
+		d.AdminPasswordHash = string(hash)
+		return nil
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, "save_failed", err.Error())
+		return
+	}
+	// Revoke every other session so a leaked cookie dies with the old password.
+	current := ""
+	if cookie, err := r.Cookie(sessionCookieName); err == nil {
+		current = cookie.Value
+	}
+	s.sessionMu.Lock()
+	for token := range s.sessions {
+		if token != current {
+			delete(s.sessions, token)
+		}
+	}
+	s.sessionMu.Unlock()
+	_ = s.store.AddEvent("info", "admin password changed", "")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -142,12 +221,15 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	cfg := s.currentConfig()
 	snap := s.store.Snapshot()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"config":        cfg.Public(),
-		"status":        snap.Status,
-		"targets":       snap.Targets,
-		"counters":      snap.Counters,
-		"current_bytes": cost.CurrentRemoteBytes(snap),
-		"recent_events": snap.RecentEvents,
+		"version":           buildinfo.Version,
+		"config":            cfg.Public(),
+		"status":            snap.Status,
+		"targets":           snap.Targets,
+		"counters":          snap.Counters,
+		"current_bytes":     cost.CurrentRemoteBytes(snap),
+		"free_tier_class_a": cost.StandardFreeClassA,
+		"free_tier_class_b": cost.StandardFreeClassB,
+		"recent_events":     snap.RecentEvents,
 	})
 }
 
@@ -160,10 +242,15 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		BaseDir           *string  `json:"base_dir"`
 		StateDir          *string  `json:"state_dir"`
 		ListenAddr        *string  `json:"listen_addr"`
+		SyncMethod        *string  `json:"sync_method"`
 		BucketName        *string  `json:"bucket_name"`
 		AccountID         *string  `json:"account_id"`
 		CloudflareToken   *string  `json:"cloudflare_token"`
 		ObjectPrefix      *string  `json:"object_prefix"`
+		GitHubRepo        *string  `json:"github_repo"`
+		GitHubToken       *string  `json:"github_token"`
+		GitHubBranch      *string  `json:"github_branch"`
+		RepoDir           *string  `json:"repo_dir"`
 		SyncInterval      *string  `json:"sync_interval"`
 		StorageCapBytes   *int64   `json:"storage_cap_bytes"`
 		ClassAWarnRatio   *float64 `json:"class_a_warn_ratio"`
@@ -200,6 +287,21 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.ObjectPrefix != nil {
 		cfg.ObjectPrefix = strings.TrimSpace(*body.ObjectPrefix)
+	}
+	if body.SyncMethod != nil {
+		cfg.SyncMethod = strings.TrimSpace(*body.SyncMethod)
+	}
+	if body.GitHubRepo != nil {
+		cfg.GitHubRepo = strings.TrimSpace(*body.GitHubRepo)
+	}
+	if body.GitHubToken != nil && strings.TrimSpace(*body.GitHubToken) != "" && strings.TrimSpace(*body.GitHubToken) != "********" {
+		cfg.GitHubToken = strings.TrimSpace(*body.GitHubToken)
+	}
+	if body.GitHubBranch != nil {
+		cfg.GitHubBranch = strings.TrimSpace(*body.GitHubBranch)
+	}
+	if body.RepoDir != nil {
+		cfg.RepoDir = strings.TrimSpace(*body.RepoDir)
 	}
 	if body.SyncInterval != nil {
 		cfg.SyncIntervalText = strings.TrimSpace(*body.SyncInterval)
@@ -247,6 +349,7 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	s.cfg = cfg
 	s.cfgMu.Unlock()
+	s.notifyConfigChange(cfg)
 	writeJSON(w, http.StatusOK, cfg.Public())
 }
 
@@ -280,13 +383,14 @@ func (s *Server) handlePutTargets(w http.ResponseWriter, r *http.Request) {
 	}
 	s.cfg = cfg
 	s.cfgMu.Unlock()
+	s.notifyConfigChange(cfg)
 	writeJSON(w, http.StatusOK, map[string]any{"targets": cfg.Targets, "excludes": cfg.Excludes})
 }
 
 func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	result, err := s.runSync(r.Context(), syncer.ModeManual)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "sync_failed", err.Error())
+		writeSyncError(w, "sync_failed", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
@@ -295,10 +399,21 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
 	result, err := s.runSync(r.Context(), syncer.ModeVerify)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "verify_failed", err.Error())
+		writeSyncError(w, "verify_failed", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+func writeSyncError(w http.ResponseWriter, code string, err error) {
+	switch {
+	case errors.Is(err, syncer.ErrSyncBusy):
+		writeError(w, http.StatusConflict, "sync_busy", err.Error())
+	case errors.Is(err, config.ErrMissingCloudflareConfig), errors.Is(err, config.ErrMissingGitHubConfig):
+		writeError(w, http.StatusBadRequest, "not_configured", err.Error())
+	default:
+		writeError(w, http.StatusInternalServerError, code, err.Error())
+	}
 }
 
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
@@ -311,12 +426,12 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cfg := s.currentConfig()
-	remote, err := s.remoteFactory(r.Context(), cfg)
+	runner, err := s.runnerFactory(r.Context(), cfg)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "remote_unavailable", err.Error())
 		return
 	}
-	if err := syncer.New(cfg, s.store, remote).DeleteRemote(r.Context(), body.Target, body.Confirm); err != nil {
+	if err := runner.DeleteRemote(r.Context(), body.Target, body.Confirm); err != nil {
 		writeError(w, http.StatusBadRequest, "delete_failed", err.Error())
 		return
 	}
@@ -325,15 +440,17 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) runSync(ctx context.Context, mode syncer.Mode) (syncer.Result, error) {
 	cfg := s.currentConfig()
-	remote, err := s.remoteFactory(ctx, cfg)
+	if err := cfg.ValidateSyncConfig(); err != nil {
+		return syncer.Result{}, err
+	}
+	runner, err := s.runnerFactory(ctx, cfg)
 	if err != nil {
 		return syncer.Result{}, err
 	}
-	sync := syncer.New(cfg, s.store, remote)
 	if mode == syncer.ModeVerify {
-		return sync.Verify(ctx)
+		return runner.Verify(ctx)
 	}
-	return sync.Sync(ctx, mode)
+	return runner.Sync(ctx, mode)
 }
 
 func (s *Server) currentConfig() config.Config {
@@ -342,9 +459,39 @@ func (s *Server) currentConfig() config.Config {
 	return s.cfg
 }
 
+func (s *Server) notifyConfigChange(cfg config.Config) {
+	if s.OnConfigChange != nil {
+		s.OnConfigChange(cfg)
+	}
+}
+
+func (s *Server) sessionCookie(r *http.Request, value string, ttl time.Duration) *http.Cookie {
+	cookie := &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    value,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   r.TLS != nil,
+	}
+	if ttl > 0 {
+		cookie.Expires = time.Now().Add(ttl)
+	}
+	return cookie
+}
+
+func (s *Server) pruneSessionsLocked() {
+	now := time.Now()
+	for token, expires := range s.sessions {
+		if now.After(expires) {
+			delete(s.sessions, token)
+		}
+	}
+}
+
 func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		cookie, err := r.Cookie("r2sync_session")
+		cookie, err := r.Cookie(sessionCookieName)
 		if err != nil || cookie.Value == "" {
 			writeError(w, http.StatusUnauthorized, "unauthorized", "login required")
 			return

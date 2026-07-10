@@ -23,20 +23,33 @@ const (
 	DefaultConfigFileName   = "config.json"
 	DefaultStateFileName    = "state.json"
 	DefaultTarget           = "data/sophnet.db"
+	DefaultGitHubBranch     = "main"
 	envPrefix               = "R2SYNC_"
 	redactedSecret          = "********"
 )
 
+// Sync methods selectable via sync_method / R2SYNC_SYNC_METHOD.
+const (
+	MethodR2     = "r2"
+	MethodGitHub = "github"
+)
+
 var ErrMissingCloudflareConfig = errors.New("missing Cloudflare R2 configuration")
+var ErrMissingGitHubConfig = errors.New("missing GitHub repository configuration")
 
 type Config struct {
 	BaseDir           string        `json:"base_dir"`
 	StateDir          string        `json:"state_dir"`
 	ListenAddr        string        `json:"listen_addr"`
+	SyncMethod        string        `json:"sync_method,omitempty"`
 	BucketName        string        `json:"bucket_name"`
 	AccountID         string        `json:"account_id,omitempty"`
 	CloudflareToken   string        `json:"cloudflare_token,omitempty"`
 	ObjectPrefix      string        `json:"object_prefix,omitempty"`
+	GitHubRepo        string        `json:"github_repo,omitempty"`
+	GitHubToken       string        `json:"github_token,omitempty"`
+	GitHubBranch      string        `json:"github_branch,omitempty"`
+	RepoDir           string        `json:"repo_dir,omitempty"`
 	SyncInterval      time.Duration `json:"-"`
 	SyncIntervalText  string        `json:"sync_interval"`
 	Targets           []string      `json:"targets"`
@@ -57,11 +70,17 @@ type PublicConfig struct {
 	BaseDir              string   `json:"base_dir"`
 	StateDir             string   `json:"state_dir"`
 	ListenAddr           string   `json:"listen_addr"`
+	SyncMethod           string   `json:"sync_method"`
 	BucketName           string   `json:"bucket_name"`
 	AccountID            string   `json:"account_id,omitempty"`
 	CloudflareConfigured bool     `json:"cloudflare_configured"`
 	CloudflareToken      string   `json:"cloudflare_token,omitempty"`
 	ObjectPrefix         string   `json:"object_prefix,omitempty"`
+	GitHubRepo           string   `json:"github_repo,omitempty"`
+	GitHubConfigured     bool     `json:"github_configured"`
+	GitHubToken          string   `json:"github_token,omitempty"`
+	GitHubBranch         string   `json:"github_branch"`
+	RepoDir              string   `json:"repo_dir"`
 	SyncInterval         string   `json:"sync_interval"`
 	Targets              []string `json:"targets"`
 	Excludes             []string `json:"excludes"`
@@ -84,7 +103,9 @@ func Defaults() Config {
 		BaseDir:           wd,
 		StateDir:          stateDir,
 		ListenAddr:        DefaultListenAddr,
+		SyncMethod:        MethodR2,
 		ObjectPrefix:      DefaultObjectPrefix,
+		GitHubBranch:      DefaultGitHubBranch,
 		SyncInterval:      DefaultSyncInterval,
 		SyncIntervalText:  DefaultSyncInterval.String(),
 		Targets:           []string{DefaultTarget},
@@ -103,6 +124,8 @@ func Load() (Config, error) {
 	cfg := Defaults()
 	if v := strings.TrimSpace(os.Getenv(envPrefix + "BASE_DIR")); v != "" {
 		cfg.BaseDir = v
+		// The default state dir follows the base dir unless explicitly set.
+		cfg.StateDir = filepath.Join(v, ".r2sync")
 	}
 	if v := strings.TrimSpace(os.Getenv(envPrefix + "STATE_DIR")); v != "" {
 		cfg.StateDir = v
@@ -141,6 +164,24 @@ func (c *Config) Normalize() error {
 	}
 	if c.ConfigPath == "" {
 		c.ConfigPath = filepath.Join(c.StateDir, DefaultConfigFileName)
+	}
+	switch strings.ToLower(strings.TrimSpace(c.SyncMethod)) {
+	case "", MethodR2:
+		c.SyncMethod = MethodR2
+	case MethodGitHub:
+		c.SyncMethod = MethodGitHub
+	default:
+		return fmt.Errorf("invalid sync_method %q: must be %q or %q", c.SyncMethod, MethodR2, MethodGitHub)
+	}
+	c.GitHubRepo = strings.Trim(strings.TrimSpace(c.GitHubRepo), "/")
+	if c.GitHubRepo != "" && strings.Count(c.GitHubRepo, "/") != 1 {
+		return fmt.Errorf("invalid github_repo %q: expected owner/name", c.GitHubRepo)
+	}
+	if c.GitHubBranch == "" {
+		c.GitHubBranch = DefaultGitHubBranch
+	}
+	if c.RepoDir == "" {
+		c.RepoDir = filepath.Join(c.StateDir, "repo")
 	}
 	if c.SyncIntervalText == "" {
 		c.SyncIntervalText = DefaultSyncInterval.String()
@@ -214,15 +255,25 @@ func (c Config) Public() PublicConfig {
 	if c.CloudflareToken != "" {
 		token = redactedSecret
 	}
+	ghToken := ""
+	if c.GitHubToken != "" {
+		ghToken = redactedSecret
+	}
 	return PublicConfig{
 		BaseDir:              c.BaseDir,
 		StateDir:             c.StateDir,
 		ListenAddr:           c.ListenAddr,
+		SyncMethod:           c.SyncMethod,
 		BucketName:           c.BucketName,
 		AccountID:            c.AccountID,
 		CloudflareConfigured: c.CloudflareToken != "",
 		CloudflareToken:      token,
 		ObjectPrefix:         c.ObjectPrefix,
+		GitHubRepo:           c.GitHubRepo,
+		GitHubConfigured:     c.GitHubToken != "",
+		GitHubToken:          ghToken,
+		GitHubBranch:         c.GitHubBranch,
+		RepoDir:              c.RepoDir,
 		SyncInterval:         c.SyncIntervalTextOrDefault(),
 		Targets:              append([]string(nil), c.Targets...),
 		Excludes:             append([]string(nil), c.Excludes...),
@@ -238,6 +289,30 @@ func (c Config) Public() PublicConfig {
 
 func (c Config) HasCloudflareConfig() bool {
 	return strings.TrimSpace(c.BucketName) != "" && strings.TrimSpace(c.CloudflareToken) != ""
+}
+
+func (c Config) HasGitHubConfig() bool {
+	return strings.TrimSpace(c.GitHubRepo) != "" && strings.TrimSpace(c.GitHubToken) != ""
+}
+
+// HasSyncConfig reports whether the selected sync method has enough
+// configuration to run.
+func (c Config) HasSyncConfig() bool {
+	if c.SyncMethod == MethodGitHub {
+		return c.HasGitHubConfig()
+	}
+	return c.HasCloudflareConfig()
+}
+
+// ValidateSyncConfig returns the method-specific missing-configuration error.
+func (c Config) ValidateSyncConfig() error {
+	if c.SyncMethod == MethodGitHub {
+		if !c.HasGitHubConfig() {
+			return ErrMissingGitHubConfig
+		}
+		return nil
+	}
+	return c.ValidateCloudflareConfig()
 }
 
 func (c Config) ValidateCloudflareConfig() error {
@@ -266,12 +341,18 @@ func applyEnv(c *Config) {
 	setString("BASE_DIR", &c.BaseDir)
 	setString("STATE_DIR", &c.StateDir)
 	setString("LISTEN_ADDR", &c.ListenAddr)
+	setString("SYNC_METHOD", &c.SyncMethod)
 	setString("BUCKET", &c.BucketName)
 	setString("BUCKET_NAME", &c.BucketName)
 	setString("ACCOUNT_ID", &c.AccountID)
 	setString("TOKEN", &c.CloudflareToken)
 	setString("CLOUDFLARE_TOKEN", &c.CloudflareToken)
 	setString("OBJECT_PREFIX", &c.ObjectPrefix)
+	setString("GITHUB_REPO", &c.GitHubRepo)
+	setString("GITHUB_TOKEN", &c.GitHubToken)
+	setString("GITHUB_PAT", &c.GitHubToken)
+	setString("GITHUB_BRANCH", &c.GitHubBranch)
+	setString("REPO_DIR", &c.RepoDir)
 	setString("SYNC_INTERVAL", &c.SyncIntervalText)
 	setString("ADMIN_PASSWORD_HASH", &c.AdminPasswordHash)
 
